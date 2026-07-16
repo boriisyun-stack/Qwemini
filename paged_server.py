@@ -28,8 +28,34 @@ PERSONA_SYSTEM = (
     "Goolibaba combines Google and Alibaba. Always reply in the user's language. "
     "Be concise and accurate, use conversation context and tool results, and say when uncertain. "
     "Do not give an excessive self-introduction or use unnecessary emojis. "
-    "Finish each response only after completing the thought; never stop mid-sentence or leave a code block unclosed."
+    "Finish each response only after completing the thought; never stop mid-sentence or leave a code block unclosed. "
+    "For creative writing requests such as poems, stories, or essays, briefly acknowledge the request in the user's language (for example, '네, 알겠습니다.') before starting the work, then provide the requested piece."
 )
+
+MODEL_PROFILES = {
+    "qwemini-flash-lite": {"label": "Flash-lite", "top_k": 6},
+    "qwemini-flash": {"label": "Flash", "top_k": 8},
+    "qwemini-pro": {"label": "Pro", "top_k": 10},
+}
+
+
+def profile_for(request: dict) -> tuple[str, dict]:
+    requested = str(request.get("model") or request.get("profile") or "qwemini-pro").lower()
+    if requested in MODEL_PROFILES:
+        return requested, MODEL_PROFILES[requested]
+    if requested in {"flash-lite", "flash_lite", "lite"}:
+        return "qwemini-flash-lite", MODEL_PROFILES["qwemini-flash-lite"]
+    if requested in {"flash", "standard"}:
+        return "qwemini-flash", MODEL_PROFILES["qwemini-flash"]
+    return "qwemini-pro", MODEL_PROFILES["qwemini-pro"]
+
+
+def set_model_top_k(model, top_k: int):
+    """Change routed expert count for the already-loaded MLX model."""
+    for layer in getattr(model.model, "layers", []):
+        mlp = getattr(layer, "mlp", None)
+        if hasattr(mlp, "top_k"):
+            mlp.top_k = top_k
 
 
 class ToolRunner:
@@ -553,6 +579,9 @@ class Handler(BaseHTTPRequestHandler):
             size = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(size))
             conversation_id = str(request.get("conversation_id") or uuid.uuid4())
+            profile_name, profile = profile_for(request)
+            with self.generation_lock:
+                set_model_top_k(self.model, profile["top_k"])
             messages = request.get("messages")
             with self.session_lock:
                 if messages is None:
@@ -618,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
                     if codegraph_answer is not None:
                         event = {"choices": [{"delta": {"content": codegraph_answer}}], "done": False}
                         self.wfile.write(("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode())
-                        metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": 10, "codegraph": True}
+                        metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": profile["top_k"], "profile": profile_name, "codegraph": True}
                         with self.session_lock:
                             self.sessions[conversation_id] = messages + [{"role": "assistant", "content": codegraph_answer}]
                         self._record_usage(conversation_id, latest_user_text, codegraph_answer, pipeline="CodeGraph")
@@ -634,7 +663,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     event = {"choices": [{"delta": {"content": progressive_answer}}], "done": False}
                     self.wfile.write(("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode())
-                    metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": 10, "progressive_writer": True}
+                    metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": profile["top_k"], "profile": profile_name, "progressive_writer": True}
                     with self.session_lock:
                         self.sessions[conversation_id] = messages + [{"role": "assistant", "content": progressive_answer}]
                     self._record_usage(conversation_id, latest_user_text, progressive_answer, pipeline="ProgressiveWriter")
@@ -652,7 +681,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                 elapsed_ms = round((time.perf_counter() - started) * 1000)
                 full_answer = "".join(answer_parts)
-                metrics = {"prompt_tokens": response.prompt_tokens, "generation_tokens": response.generation_tokens, "elapsed_ms": elapsed_ms, "tok_s": round(response.generation_tps, 2), "prompt_tps": round(response.prompt_tps, 2), "model_size_gb": 42.3, "active_params": "3B", "top_k": 10}
+                metrics = {"prompt_tokens": response.prompt_tokens, "generation_tokens": response.generation_tokens, "elapsed_ms": elapsed_ms, "tok_s": round(response.generation_tps, 2), "prompt_tps": round(response.prompt_tps, 2), "model_size_gb": 42.3, "active_params": "3B", "top_k": profile["top_k"], "profile": profile_name}
                 with self.session_lock:
                     self.sessions[conversation_id] = messages + [{"role": "assistant", "content": full_answer}]
                 self._record_usage(conversation_id, latest_user_text, full_answer, pipeline="standard", metrics=metrics)
