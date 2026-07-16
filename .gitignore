@@ -4,4 +4,4 @@ __pycache__/
 model_q4_mlx_base/
 model_q4_mlx_paged/
 .DS_Store
-
+qwemini_usage.jsonl

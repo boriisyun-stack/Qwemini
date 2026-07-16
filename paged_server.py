@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -494,7 +495,25 @@ class Handler(BaseHTTPRequestHandler):
     sessions = {}
     session_lock = threading.Lock()
     generation_lock = threading.Lock()
+    usage_log_lock = threading.Lock()
+    usage_log_path = Path("qwemini_usage.jsonl")
     vision = VisionCaptioner()
+
+    def _record_usage(self, conversation_id: str, user_text: str, answer: str, **extra):
+        """Append one auditable request/response record without affecting generation."""
+        forwarded = self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For")
+        client = (forwarded.split(",", 1)[0].strip() if forwarded else self.client_address[0])
+        record = {
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+            "client": client,
+            "conversation_id": conversation_id,
+            "input": user_text,
+            "output": answer,
+            **extra,
+        }
+        with self.usage_log_lock:
+            with self.usage_log_path.open("a", encoding="utf-8") as log:
+                log.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _send(self, status, payload, content_type="application/json"):
         body = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode()
@@ -601,6 +620,7 @@ class Handler(BaseHTTPRequestHandler):
                         metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": 10, "codegraph": True}
                         with self.session_lock:
                             self.sessions[conversation_id] = messages + [{"role": "assistant", "content": codegraph_answer}]
+                        self._record_usage(conversation_id, latest_user_text, codegraph_answer, pipeline="CodeGraph")
                         self.wfile.write(("data: " + json.dumps({"done": True, "metrics": metrics}) + "\n\n").encode())
                         self.wfile.flush()
                         self.close_connection = True
@@ -616,6 +636,7 @@ class Handler(BaseHTTPRequestHandler):
                     metrics = {"prompt_tokens": 0, "generation_tokens": 0, "elapsed_ms": 0, "tok_s": 0, "prompt_tps": 0, "model_size_gb": 42.3, "active_params": "3B", "top_k": 10, "progressive_writer": True}
                     with self.session_lock:
                         self.sessions[conversation_id] = messages + [{"role": "assistant", "content": progressive_answer}]
+                    self._record_usage(conversation_id, latest_user_text, progressive_answer, pipeline="ProgressiveWriter")
                     self.wfile.write(("data: " + json.dumps({"done": True, "metrics": metrics}) + "\n\n").encode())
                     self.wfile.flush()
                     self.close_connection = True
@@ -633,6 +654,7 @@ class Handler(BaseHTTPRequestHandler):
                 metrics = {"prompt_tokens": response.prompt_tokens, "generation_tokens": response.generation_tokens, "elapsed_ms": elapsed_ms, "tok_s": round(response.generation_tps, 2), "prompt_tps": round(response.prompt_tps, 2), "model_size_gb": 42.3, "active_params": "3B", "top_k": 10}
                 with self.session_lock:
                     self.sessions[conversation_id] = messages + [{"role": "assistant", "content": full_answer}]
+                self._record_usage(conversation_id, latest_user_text, full_answer, pipeline="standard", metrics=metrics)
                 self.wfile.write(("data: " + json.dumps({"done": True, "metrics": metrics}) + "\n\n").encode())
                 self.wfile.flush()
                 self.close_connection = True
@@ -654,6 +676,7 @@ class Handler(BaseHTTPRequestHandler):
                                       verbose=False)
             with self.session_lock:
                 self.sessions[conversation_id] = messages + [{"role": "assistant", "content": answer}]
+            self._record_usage(conversation_id, latest_user_text, answer, pipeline="standard")
             self._send(200, {"id": "paged-qwen", "object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}]})
         except Exception as exc:
             self._send(500, {"error": {"message": str(exc)}})
