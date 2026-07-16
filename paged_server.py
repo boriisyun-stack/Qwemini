@@ -732,7 +732,9 @@ def main():
     parser.add_argument("--paged", type=Path, default=Path("model_q4_mlx_paged"))
     args = parser.parse_args()
     # Shared layer caches avoid re-reading the same routed shard three times.
-    model, tokenizer = load_paged(args.base, args.paged, top_k=10, cache_experts=24)
+    # Keep the per-layer expert cache conservative on 16GB Macs. Top-k routing
+    # still controls quality; this only limits resident shard memory.
+    model, tokenizer = load_paged(args.base, args.paged, top_k=10, cache_experts=6)
     Handler.model, Handler.tokenizer = model, tokenizer
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Serving LAN UI on http://0.0.0.0:{args.port}")
